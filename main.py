@@ -13,6 +13,14 @@ app.middleware("http")(trace_id_middleware)
 
 logger.info("FastAPI LangGraph 서버가 성공적으로 시작되었습니다!")
 
+# 스프링 부트의 GoodPriceStore 엔티티 모양 그대로 받기 (CamelCase 일치)
+class GoodPriceStore(BaseModel):
+    shId: str | None = None
+    shName: str | None = None
+    indutyCodeSeName: str | None = None
+    shAddr: str | None = None
+    shInfo: str | None = None
+
 
 # --- 1. 안드로이드(Spring)에서 넘어오는 데이터 모양 (요청) ---
 class CourseRequest(BaseModel):
@@ -21,6 +29,8 @@ class CourseRequest(BaseModel):
     members: str           # 예: 최소인원- 최대인원
     budget: str            # 예: 100000원
     prompt: str            # 예: "외국인 친구랑 갈 종로 투어 짜줘"
+    # 스프링 부트가 넘겨주는 착한가격업소 리스트 (없으면 빈 리스트)
+    recommendedStores: list[GoodPriceStore] = []
 
 # --- 2. AI가 무조건 지켜야 하는 완벽한 JSON 구조 (응답) ---
 class Place(BaseModel):
@@ -44,11 +54,20 @@ system_prompt = """너는 서울의 숨겨진 로컬 명소를 기가 막히게 
 
 [고객의 상황 및 취향]
 - 투어 일정: {date}
-- 선호하는 테마(카테고리): {categories}
+- 선호하는 테마: {categories}
+- 참여 인원: {members}
+- 예산: {budget}
 
 [고객의 특별 요청사항]
 {prompt}
 
+[필수 참고 데이터: 서울시 착한 가격업소 추천 리스트]
+{stores_info}
+
+[지시사항]
+1. '필수 참고 데이터'에 식당이나 장소가 제공되었다면, 고객의 동선에 맞춰 우선적으로 코스에 포함시켜줘. (가게 이름과 주소를 정확히 사용할 것)
+2. 제공된 데이터가 없거나(비어있거나) 코스를 구성하기에 부족하다면, 네가 알고 있는 서울의 유명 명소와 맛집을 자유롭게 섞어서 완벽한 코스를 만들어줘.
+3. 무조건 정해진 JSON 형식으로 응답해.
 위 조건들을 완벽하게 반영해서, 코스에 대한 '매력적인 소개글(description)'과 '장소 목록(places)'을 작성해줘."""
 
 prompt_template = ChatPromptTemplate.from_messages([
@@ -60,7 +79,17 @@ prompt_template = ChatPromptTemplate.from_messages([
 @app.post("/api/ai/course")
 async def generate_course(request: CourseRequest):
     # 로거를 사용하면 알아서 [abc-123...] Trace ID가 찍힙니다!
-    logger.info(f"AI 코스 생성 요청 수신: 카테고리={request.categories}, 프롬프트='{request.prompt}'")
+    logger.info(f"AI 코스 생성 요청 수신: 카테고리={request.categories}, 프롬프트='{request.prompt}', 식당 데이터={len(request.recommendedStores)}개 전달됨")
+    
+    # 스프링 부트가 보내준 착한가게 데이터를 AI가 읽기 편한 텍스트로 변환
+    if request.recommendedStores:
+        stores_info = "\n".join([
+            f"- 이름: {s.shName} (업종: {s.indutyCodeSeName}) / 주소: {s.shAddr} / 정보: {s.shInfo}" 
+            for s in request.recommendedStores
+        ])
+    else:
+        stores_info = "현재 조건에 맞는 추천 착한가격업소가 없습니다. 일반 명소로 추천해주세요."
+    
     # LangChain 체인 연결 (프롬프트 -> 구조화된 LLM)
     chain = prompt_template | structured_llm
     
@@ -68,7 +97,10 @@ async def generate_course(request: CourseRequest):
     result = chain.invoke({
         "date": request.date,
         "categories": ", ".join(request.categories),
-        "prompt": request.prompt
+        "members": request.members,
+        "budget": request.budget,
+        "prompt": request.prompt,
+        "stores_info": stores_info  # 변환된 가게 정보 주입!
     })
     
     logger.info("AI 코스 생성 완료 및 응답 반환")
