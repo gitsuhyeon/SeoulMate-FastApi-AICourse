@@ -21,6 +21,15 @@ class GoodPriceStore(BaseModel):
     shAddr: str | None = None
     shInfo: str | None = None
 
+class MeetupCongestionDto(BaseModel):
+    level: str | None = None # 붐빔 
+    label: str | None = None
+    sourceType: str | None = None
+    sourceMessage: str | None = None
+    basisPlaceName: str | None = None
+    ppltnMin: int | None = None
+    ppltnMax: int | None = None
+    updatedAt: str | None = None
 
 # --- 1. 안드로이드(Spring)에서 넘어오는 데이터 모양 (요청) ---
 class CourseRequest(BaseModel):
@@ -31,6 +40,7 @@ class CourseRequest(BaseModel):
     prompt: str            # 예: "외국인 친구랑 갈 종로 투어 짜줘"
     # 스프링 부트가 넘겨주는 착한가격업소 리스트 (없으면 빈 리스트)
     recommendedStores: list[GoodPriceStore] = []
+    congestionData: list[MeetupCongestionDto] = [] 
 
 # --- 2. AI가 무조건 지켜야 하는 완벽한 JSON 구조 (응답) ---
 class Place(BaseModel):
@@ -64,10 +74,15 @@ system_prompt = """너는 서울의 숨겨진 로컬 명소를 기가 막히게 
 [필수 참고 데이터: 서울시 착한 가격업소 추천 리스트]
 {stores_info}
 
+[선택 참고 데이터: 주요 장소 혼잡도 데이터]
+{congestion_info}
+
 [지시사항]
 1. '필수 참고 데이터'에 식당이나 장소가 제공되었다면, 고객의 동선에 맞춰 우선적으로 코스에 포함시켜줘. (가게 이름과 주소를 정확히 사용할 것)
-2. 제공된 데이터가 없거나(비어있거나) 코스를 구성하기에 부족하다면, 네가 알고 있는 서울의 유명 명소와 맛집을 자유롭게 섞어서 완벽한 코스를 만들어줘.
-3. 무조건 정해진 JSON 형식으로 응답해.
+2. 제공된 데이터가 없거나(비어있거나) 코스를 구성하기에 부족하다면, 네가 알고 있는 서울의 유명 명소, 관광지, 카페 맛집을 자유롭게 섞어서 완벽한 코스를 만들어줘.
+3. **반드시 최소 3개 이상의 장소로 이루어진 꽉 찬 풀(Full) 코스**를 완성
+4. **'장소 혼잡도 데이터'가 존재하고, 사용자 프롬프트에 '한적한', '조용한', '평화로운' 등의 비슷한 단어가 온다면, 반드시 현재 '붐빔' 상태인 곳은 가급적 피하고 쾌적한 동선을 제안해줘.**
+5. 무조건 정해진 JSON 형식으로 응답해.
 위 조건들을 완벽하게 반영해서, 코스에 대한 '매력적인 소개글(description)'과 '장소 목록(places)'을 작성해줘."""
 
 prompt_template = ChatPromptTemplate.from_messages([
@@ -81,15 +96,31 @@ async def generate_course(request: CourseRequest):
     # 로거를 사용하면 알아서 [abc-123...] Trace ID가 찍힙니다!
     logger.info(f"AI 코스 생성 요청 수신: 카테고리={request.categories}, 프롬프트='{request.prompt}', 식당 데이터={len(request.recommendedStores)}개 전달됨")
     
-    # 스프링 부트가 보내준 착한가게 데이터를 AI가 읽기 편한 텍스트로 변환
+    # 스프링 부트가 보내준 [착한가게 데이터]를 AI가 읽기 편한 텍스트로 변환
     if request.recommendedStores:
         stores_info = "\n".join([
             f"- 이름: {s.shName} (업종: {s.indutyCodeSeName}) / 주소: {s.shAddr} / 정보: {s.shInfo}" 
             for s in request.recommendedStores
         ])
     else:
-        stores_info = "현재 조건에 맞는 추천 착한가격업소가 없습니다. 일반 명소로 추천해주세요."
+        stores_info = "현재 조건에 맞는 추천 착한가격업소가 없습니다. 자유롭게 서울 명소 4~5곳을 추천해주세요."
     
+    # [혼잡도 데이터 파싱] 스프링에서 보낸 basisPlaceName과 label(한글) 사용
+    if request.congestionData:
+        # basisPlaceName이 존재하고, label이 '정보 없음'이 아닌 경우만 필터링
+        valid_congestion = [
+            f"- 장소: {c.basisPlaceName} / 예상 혼잡도: {c.label}"
+            for c in request.congestionData 
+            if c.basisPlaceName and c.label and c.label != "정보 없음"
+        ]
+        
+        if valid_congestion:
+            congestion_info = "\n".join(valid_congestion)
+        else:
+            congestion_info = "현재 유효한 혼잡도 데이터가 없습니다."
+    else:
+        congestion_info = "현재 제공된 혼잡도 데이터가 없습니다."
+
     # LangChain 체인 연결 (프롬프트 -> 구조화된 LLM)
     chain = prompt_template | structured_llm
     
@@ -100,9 +131,10 @@ async def generate_course(request: CourseRequest):
         "members": request.members,
         "budget": request.budget,
         "prompt": request.prompt,
-        "stores_info": stores_info  # 변환된 가게 정보 주입!
+        "stores_info": stores_info,  # 변환된 가게 정보 주입!
+        "congestion_info": congestion_info
     })
     
-    logger.info("AI 코스 생성 완료 및 응답 반환")
+    logger.info("AI 코스 생성 완료: 총 {len(result.places)}개 장소 반환")
     # AI가 뱉어낸 결과를 그대로 JSON으로 반환!
     return result
