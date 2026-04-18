@@ -1,10 +1,13 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from config import OPENAI_API_KEY
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from logger import logger
 from middleware import trace_id_middleware
+from fastapi import HTTPException
+from typing import Optional
+import logging
 #vscode라 가상환경 못잡을때 cmd+shift+p > Python: Select Interpreter > 가상환경체크
 
 app = FastAPI()
@@ -80,8 +83,8 @@ system_prompt = """너는 서울의 숨겨진 로컬 명소를 기가 막히게 
 2. 제공된 데이터가 없거나(비어있거나) 코스를 구성하기에 부족하다면, 네가 알고 있는 서울의 유명 명소, 관광지, 카페 (1-2개만) 맛집(1개만)을 자유롭게 섞어서 완벽한 코스를 만들어줘.
 3. **🚨 절대 가짜 위도/경도(GPS) 좌표를 만들지 마. 반드시 해당 장소의 정확한 'address(주소)'만 정확한 텍스트로 제공해.**
 4. **반드시 최소 5개 이상의 장소로 이루어진 꽉 찬 풀(Full) 코스**를 완성
-6. **'장소 혼잡도 데이터'가 존재하고, 사용자 프롬프트에 '한적한', '조용한', '평화로운' 등의 비슷한 단어가 온다면, 반드시 현재 '붐빔' 상태인 곳은 가급적 피하고 쾌적한 동선을 제안해줘.**
-7. 무조건 정해진 JSON 형식으로 응답해.
+5. **'장소 혼잡도 데이터'가 존재하고, 사용자 프롬프트에 '한적한', '조용한', '평화로운' 등의 비슷한 단어가 온다면, 반드시 현재 '붐빔' 상태인 곳은 가급적 피하고 쾌적한 동선을 제안해줘.**
+6. 무조건 정해진 JSON 형식으로 응답해.
 위 조건들을 완벽하게 반영해서, 코스에 대한 '매력적인 소개글(description)'과 '장소 목록(places)'을 작성해줘."""
 
 prompt_template = ChatPromptTemplate.from_messages([
@@ -89,11 +92,16 @@ prompt_template = ChatPromptTemplate.from_messages([
     ("user", "위 조건에 맞춰서 코스를 짜줘!")
 ])
 
+logger = logging.getLogger(__name__)
+
 # --- 4. API 엔드포인트 오픈 ---
 @app.post("/api/ai/course")
-async def generate_course(request: CourseRequest):
+async def generate_course(
+    request: CourseRequest,
+    x_trace_id: Optional[str] = Header(default="NoTrace", alias="X-Trace-Id")
+    ):
     # 로거를 사용하면 알아서 [abc-123...] Trace ID가 찍힙니다!
-    logger.info(f"AI 코스 생성 요청 수신: 카테고리={request.categories}, 프롬프트='{request.prompt}', 식당 데이터={len(request.recommendedStores)}개 전달됨")
+    logger.info(f"[{x_trace_id}] AI 코스 생성 요청 수신: 카테고리={request.categories}, 프롬프트='{request.prompt}', 식당 데이터={len(request.recommendedStores)}개 전달됨")
     
 
     #  스프링 부트가 보내준 가게 정보 + [위도/경도]를 묶어서 AI에게 전달
@@ -112,7 +120,7 @@ async def generate_course(request: CourseRequest):
         valid_congestion = [
             f"- 장소: {c.areaNm} / 예상 혼잡도: {c.congestionLabel}"
             for c in request.congestionData 
-            if c.areaNm and c.congestionLabel and c.congestionLabel != "정보 없음"
+            if c.areaNm and c.congestionLabel and c.congestionLabel.strip() != "정보 없음"
         ]
         
         if valid_congestion:
@@ -122,20 +130,26 @@ async def generate_course(request: CourseRequest):
     else:
         congestion_info = "현재 제공된 혼잡도 데이터가 없습니다."
 
+    # LM에게 주입될 '혼잡도 데이터 원본' 로그 확인
+    logger.info(f"[{x_trace_id}][Prompt Input] 전달된 혼잡도 정보:\n{congestion_info}")
+
     # LangChain 체인 연결 (프롬프트 -> 구조화된 LLM)
     chain = prompt_template | structured_llm
-    
-    # 안드로이드에서 받은 데이터를 프롬프트의 빈칸({date}, {categories} 등)에 쏙쏙 끼워 넣습니다.
-    result = chain.invoke({
-        "date": request.date,
-        "categories": ", ".join(request.categories),
-        "members": request.members,
-        "budget": request.budget,
-        "prompt": request.prompt,
-        "stores_info": stores_info,  # 변환된 가게 정보 주입!
-        "congestion_info": congestion_info
-    })
-    
-    logger.info(f"AI 코스 생성 완료: 총 {len(result.places)}개 장소 반환")
-    # AI가 뱉어낸 결과를 그대로 JSON으로 반환!
-    return result
+
+    try:
+        result = chain.invoke({
+            "date": request.date,
+            "categories": ", ".join(request.categories),
+            "members": request.members,
+            "budget": request.budget,
+            "prompt": request.prompt,
+            "stores_info": stores_info,
+            "congestion_info": congestion_info
+        })
+        logger.info(f"[{x_trace_id}]AI 코스 생성 완료: 총 {len(result.places)}개 장소 반환")
+        return result
+        
+    except Exception as e:
+        logger.error(f"[{x_trace_id}]LLM 체인 실행 중 에러 발생: {str(e)}")
+        # FastAPI에서 클라이언트(스프링/안드로이드)에게 적절한 500 에러 응답을 내려주는 처리 필요
+        raise HTTPException(status_code=500, detail="AI 코스 생성에 실패했습니다.")
