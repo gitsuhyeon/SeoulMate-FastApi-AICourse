@@ -20,16 +20,16 @@ class GoodPriceStore(BaseModel):
     indutyCodeSeName: str | None = None
     shAddr: str | None = None
     shInfo: str | None = None
+    lat: float | None = None 
+    lng: float | None = None
 
-class MeetupCongestionDto(BaseModel):
-    level: str | None = None # 붐빔 
-    label: str | None = None
-    sourceType: str | None = None
-    sourceMessage: str | None = None
-    basisPlaceName: str | None = None
+class SpotCongestion(BaseModel):
+    areaNm: str | None = None
+    congestionLevel: str | None = None
+    congestionLabel: str | None = None
     ppltnMin: int | None = None
     ppltnMax: int | None = None
-    updatedAt: str | None = None
+    observedAt: str | None = None
 
 # --- 1. 안드로이드(Spring)에서 넘어오는 데이터 모양 (요청) ---
 class CourseRequest(BaseModel):
@@ -40,13 +40,11 @@ class CourseRequest(BaseModel):
     prompt: str            # 예: "외국인 친구랑 갈 종로 투어 짜줘"
     # 스프링 부트가 넘겨주는 착한가격업소 리스트 (없으면 빈 리스트)
     recommendedStores: list[GoodPriceStore] = []
-    congestionData: list[MeetupCongestionDto] = [] 
-
+    congestionData: list[SpotCongestion] = []
 # --- 2. AI가 무조건 지켜야 하는 완벽한 JSON 구조 (응답) ---
 class Place(BaseModel):
     name: str = Field(description="장소의 이름 (예: 창덕궁)")
-    lat: float = Field(description="장소의 위도 (예: 37.5814)")
-    lng: float = Field(description="장소의 경도 (예: 126.9910)")
+    address: str = Field(description="해당 장소의 도로명/지번 주소. 정확히 모르면 대략적인 지역명(예: 서울 종로구)만 작성할 것")
 
 class CourseResponse(BaseModel):
     description: str = Field(description="이 코스에 대한 1~2줄의 매력적인 소개글 (기획 의도)")
@@ -80,9 +78,10 @@ system_prompt = """너는 서울의 숨겨진 로컬 명소를 기가 막히게 
 [지시사항]
 1. '필수 참고 데이터'에 식당이나 장소가 제공되었다면, 고객의 동선에 맞춰 우선적으로 코스에 포함시켜줘. (가게 이름과 주소를 정확히 사용할 것)
 2. 제공된 데이터가 없거나(비어있거나) 코스를 구성하기에 부족하다면, 네가 알고 있는 서울의 유명 명소, 관광지, 카페 맛집을 자유롭게 섞어서 완벽한 코스를 만들어줘.
-3. **반드시 최소 3개 이상의 장소로 이루어진 꽉 찬 풀(Full) 코스**를 완성
-4. **'장소 혼잡도 데이터'가 존재하고, 사용자 프롬프트에 '한적한', '조용한', '평화로운' 등의 비슷한 단어가 온다면, 반드시 현재 '붐빔' 상태인 곳은 가급적 피하고 쾌적한 동선을 제안해줘.**
-5. 무조건 정해진 JSON 형식으로 응답해.
+3. **🚨 절대 가짜 위도/경도(GPS) 좌표를 만들지 마. 반드시 해당 장소의 'address(주소)'만 정확한 텍스트로 제공해.**
+4. **반드시 최소 5개 이상의 장소로 이루어진 꽉 찬 풀(Full) 코스**를 완성
+6. **'장소 혼잡도 데이터'가 존재하고, 사용자 프롬프트에 '한적한', '조용한', '평화로운' 등의 비슷한 단어가 온다면, 반드시 현재 '붐빔' 상태인 곳은 가급적 피하고 쾌적한 동선을 제안해줘.**
+7. 무조건 정해진 JSON 형식으로 응답해.
 위 조건들을 완벽하게 반영해서, 코스에 대한 '매력적인 소개글(description)'과 '장소 목록(places)'을 작성해줘."""
 
 prompt_template = ChatPromptTemplate.from_messages([
@@ -96,22 +95,24 @@ async def generate_course(request: CourseRequest):
     # 로거를 사용하면 알아서 [abc-123...] Trace ID가 찍힙니다!
     logger.info(f"AI 코스 생성 요청 수신: 카테고리={request.categories}, 프롬프트='{request.prompt}', 식당 데이터={len(request.recommendedStores)}개 전달됨")
     
-    # 스프링 부트가 보내준 [착한가게 데이터]를 AI가 읽기 편한 텍스트로 변환
+
+    #  스프링 부트가 보내준 가게 정보 + [위도/경도]를 묶어서 AI에게 전달
     if request.recommendedStores:
-        stores_info = "\n".join([
-            f"- 이름: {s.shName} (업종: {s.indutyCodeSeName}) / 주소: {s.shAddr} / 정보: {s.shInfo}" 
-            for s in request.recommendedStores
-        ])
+        stores_list = []
+        for s in request.recommendedStores:
+            # null 처리: 좌표가 있으면 프롬프트에 포함, 없으면 생략
+            coord_str = f" (위도: {s.lat}, 경도: {s.lng})" if s.lat and s.lng else ""
+            stores_list.append(f"- 이름: {s.shName} (업종: {s.indutyCodeSeName}) / 정보: {s.shInfo} / 주소: {s.shAddr}{coord_str}")
+        stores_info = "\n".join(stores_list)
     else:
-        stores_info = "현재 조건에 맞는 추천 착한가격업소가 없습니다. 자유롭게 서울 명소 4~5곳을 추천해주세요."
+        stores_info = "조건에 맞는 가게가 없습니다. 자유롭게 서울 명소 4~5곳을 추천해주세요."
     
-    # [혼잡도 데이터 파싱] 스프링에서 보낸 basisPlaceName과 label(한글) 사용
+    #  [혼잡도 데이터 파싱] 스프링에서 보낸 필드명(areaNm, congestionLabel)으로 수정
     if request.congestionData:
-        # basisPlaceName이 존재하고, label이 '정보 없음'이 아닌 경우만 필터링
         valid_congestion = [
-            f"- 장소: {c.basisPlaceName} / 예상 혼잡도: {c.label}"
+            f"- 장소: {c.areaNm} / 예상 혼잡도: {c.congestionLabel}"
             for c in request.congestionData 
-            if c.basisPlaceName and c.label and c.label != "정보 없음"
+            if c.areaNm and c.congestionLabel and c.congestionLabel != "정보 없음"
         ]
         
         if valid_congestion:
@@ -135,6 +136,6 @@ async def generate_course(request: CourseRequest):
         "congestion_info": congestion_info
     })
     
-    logger.info("AI 코스 생성 완료: 총 {len(result.places)}개 장소 반환")
+    logger.info(f"AI 코스 생성 완료: 총 {len(result.places)}개 장소 반환")
     # AI가 뱉어낸 결과를 그대로 JSON으로 반환!
     return result
