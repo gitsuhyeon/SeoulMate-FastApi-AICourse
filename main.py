@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException,Depends
 from pydantic import BaseModel, Field
 from config import OPENAI_API_KEY
 from langchain_openai import ChatOpenAI
@@ -7,10 +7,11 @@ from logger import logger
 from middleware import trace_id_middleware
 from fastapi import HTTPException
 from typing import Optional
-import logging
+#import logging
+from security import verify_api_key 
 #vscode라 가상환경 못잡을때 cmd+shift+p > Python: Select Interpreter > 가상환경체크
 
-app = FastAPI()
+app = FastAPI(dependencies=[Depends(verify_api_key)])
 # 미들웨어 장착
 app.middleware("http")(trace_id_middleware)
 
@@ -92,16 +93,13 @@ prompt_template = ChatPromptTemplate.from_messages([
     ("user", "위 조건에 맞춰서 코스를 짜줘!")
 ])
 
-logger = logging.getLogger(__name__)
+
 
 # --- 4. API 엔드포인트 오픈 ---
 @app.post("/api/ai/course")
-async def generate_course(
-    request: CourseRequest,
-    x_trace_id: Optional[str] = Header(default="NoTrace", alias="X-Trace-Id")
-    ):
-    # 로거를 사용하면 알아서 [abc-123...] Trace ID가 찍힙니다!
-    logger.info(f"[{x_trace_id}] AI 코스 생성 요청 수신: 카테고리={request.categories}, 프롬프트='{request.prompt}', 식당 데이터={len(request.recommendedStores)}개 전달됨")
+async def generate_course(request: CourseRequest):
+    # logger.py에 정의해둔 로거를 사용하면 알아서 [abc-123...] Trace ID가 찍힌당 -> 만약 안되면 generate_course 파라미터로 추가x_trace_id: Optional[str] = Header(default="NoTrace", alias="X-Trace-Id")
+    logger.info(f" AI 코스 생성 요청 수신: 카테고리={request.categories}, 프롬프트='{request.prompt}', 식당 데이터={len(request.recommendedStores)}개 전달됨")
     
 
     #  스프링 부트가 보내준 가게 정보 + [위도/경도]를 묶어서 AI에게 전달
@@ -131,7 +129,7 @@ async def generate_course(
         congestion_info = "현재 제공된 혼잡도 데이터가 없습니다."
 
     # LM에게 주입될 '혼잡도 데이터 원본' 로그 확인
-    logger.info(f"[{x_trace_id}][Prompt Input] 전달된 혼잡도 정보:\n{congestion_info}")
+    logger.info(f"[Prompt Input] 전달된 혼잡도 정보:\n{congestion_info}")
 
     # LangChain 체인 연결 (프롬프트 -> 구조화된 LLM)
     chain = prompt_template | structured_llm
@@ -146,10 +144,10 @@ async def generate_course(
             "stores_info": stores_info,
             "congestion_info": congestion_info
         })
-        logger.info(f"[{x_trace_id}]AI 코스 생성 완료: 총 {len(result.places)}개 장소 반환")
+        logger.info(f"AI 코스 생성 완료: 총 {len(result.places)}개 장소 반환")
         return result
         
     except Exception as e:
-        logger.error(f"[{x_trace_id}]LLM 체인 실행 중 에러 발생: {str(e)}")
+        logger.error(f"LLM 체인 실행 중 에러 발생: {str(e)}")
         # FastAPI에서 클라이언트(스프링/안드로이드)에게 적절한 500 에러 응답을 내려주는 처리 필요
         raise HTTPException(status_code=500, detail="AI 코스 생성에 실패했습니다.")
