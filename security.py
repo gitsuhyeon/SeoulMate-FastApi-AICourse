@@ -14,6 +14,7 @@ FASTAPI_SECRET_KEY = os.getenv("FASTAPI_SECRET_KEY")
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     """API Key를 검증하는 전역 문지기 함수"""
+    logger.info(f"수신된 API KEY: '{api_key}', 길이: {len(api_key)}")#문제 없으면 삭제
     if api_key == FASTAPI_SECRET_KEY:
         return api_key
     
