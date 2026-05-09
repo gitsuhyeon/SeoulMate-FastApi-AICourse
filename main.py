@@ -1,31 +1,34 @@
-from fastapi import FastAPI, Header, HTTPException,Depends
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, Field
 from config import OPENAI_API_KEY
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from logger import logger
 from middleware import trace_id_middleware
-from fastapi import HTTPException
-from typing import Optional
-#import logging
-from security import verify_api_key 
-#vscode라 가상환경 못잡을때 cmd+shift+p > Python: Select Interpreter > 가상환경체크
+from security import verify_api_key
 
 app = FastAPI(dependencies=[Depends(verify_api_key)])
-# 미들웨어 장착
+#---------------------------------------------------
+#로컬테스트용이라 테스트후 위에 것 살리기
+#app = FastAPI()
+
 app.middleware("http")(trace_id_middleware)
 
 logger.info("FastAPI LangGraph 서버가 성공적으로 시작되었습니다!")
 
-# 스프링 부트의 GoodPriceStore 엔티티 모양 그대로 받기 (CamelCase 일치)
-class GoodPriceStore(BaseModel):
-    shId: str | None = None
-    shName: str | None = None
-    indutyCodeSeName: str | None = None
-    shAddr: str | None = None
-    shInfo: str | None = None
-    lat: float | None = None 
-    lng: float | None = None
+
+# ============================================================
+# 요청 모델 (Spring → FastAPI)
+# ============================================================
+
+class PlaceCandidate(BaseModel):
+    """Spring이 보내는 후보 장소"""
+    id: str = Field(description="후보 ID. 'store-XXX' 또는 'culture-XXX' 형식")
+    name: str
+    address: str
+    category: str = Field(default="", description="한식, 미술관/갤러리, 공연장 등")
+    introduction: str | None = Field(default=None, description="짧은 소개")
+
 
 class SpotCongestion(BaseModel):
     areaNm: str | None = None
@@ -35,119 +38,247 @@ class SpotCongestion(BaseModel):
     ppltnMax: int | None = None
     observedAt: str | None = None
 
-# --- 1. 안드로이드(Spring)에서 넘어오는 데이터 모양 (요청) ---
+
 class CourseRequest(BaseModel):
-    date: str              # 예: "월 오후 6-7시"
-    categories: list[str]  # 예: ["#한식", "#관광"]
-    members: str           # 예: 최소인원- 최대인원
-    budget: str            # 예: 100000원
-    prompt: str            # 예: "외국인 친구랑 갈 종로 투어 짜줘"
-    # 스프링 부트가 넘겨주는 착한가격업소 리스트 (없으면 빈 리스트)
-    recommendedStores: list[GoodPriceStore] = []
+    date: str
+    categories: list[str]
+    members: str
+    budget: str
+    prompt: str
+    # ★ 신규 필드: 후보 장소 리스트 (RAG 핵심)
+    candidates: list[PlaceCandidate] = []
     congestionData: list[SpotCongestion] = []
-# --- 2. AI가 무조건 지켜야 하는 완벽한 JSON 구조 (응답) ---
-class Place(BaseModel):
-    name: str = Field(description="장소의 이름 (예: 창덕궁)")
-    address: str = Field(description="해당 장소의 도로명/지번 주소. 정확히 모르면 대략적인 지역명(예: 서울 종로구)만 작성할 것")
+
+
+# ============================================================
+# 응답 모델 (FastAPI → Spring)
+# ============================================================
 
 class CourseResponse(BaseModel):
-    description: str = Field(description="이 코스에 대한 1~2줄의 매력적인 소개글 (기획 의도)")
-    places: list[Place] = Field(description="추천 장소 리스트 (동선 순서대로 배열)")
+    """AI는 ID 리스트만 반환. 실제 장소 정보는 Spring에서 채움."""
+    description: str = Field(
+        description="코스 매력적 소개글 1~2줄. 사용자 프롬프트와 같은 언어로 작성."
+    )
+    selected_ids: list[str] = Field(
+        description="후보 리스트에서 선택한 장소의 id. 동선 순서대로 5~6개. "
+                    "반드시 후보 리스트의 id와 정확히 일치해야 함."
+    )
 
-# --- 3. LLM 및 프롬프트 셋팅 ---
-# 실행 시 터미널 환경변수에 OPENAI_API_KEY가 등록되어 있어야 합니다.
+
+# ============================================================
+# LLM 셋업
+# ============================================================
+
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, api_key=OPENAI_API_KEY)
-
-# 핵심 마법: AI에게 "무조건 CourseResponse 모양(JSON)으로만 대답해!" 라고 강제합니다.
 structured_llm = llm.with_structured_output(CourseResponse)
 
-system_prompt = """너는 서울의 숨겨진 로컬 명소를 기가 막히게 잘 아는 현지인 가이드야.
-외국인 여행자와 함께할 투어 코스를 기획해야 해.
+system_prompt = """[ABSOLUTE RULES — Never violate / 절대 규칙 — 위반 금지]
+- This service ONLY recommends places in Seoul, South Korea.
+  이 서비스는 오직 서울특별시 내의 장소만 추천한다.
+- You MUST select places ONLY from the [Place Candidates] list below.
+  반드시 [후보 장소 리스트]에서만 선택한다.
+- Never invent place names, addresses, or IDs not in the candidate list.
+  후보 리스트에 없는 장소를 만들어내지 않는다.
+- Each id in selected_ids MUST exactly match an id from the candidate list.
+  selected_ids의 각 id는 후보 리스트의 id와 문자 단위로 정확히 일치해야 한다.
 
-[고객의 상황 및 취향]
-- 투어 일정: {date}
-- 선호하는 테마: {categories}
-- 참여 인원: {members}
-- 예산: {budget}
+[Language Rule / 언어 규칙]
+- Respond in the SAME language as the user's request.
+  사용자 요청 언어로 응답한다.
+- Korean prompt → Korean description.
+- English prompt → English description.
 
-[고객의 특별 요청사항]
-{prompt}
+You are a knowledgeable local Seoul guide for travelers, especially foreign visitors.
+너는 서울의 로컬 명소를 잘 아는 가이드로, 외국인 여행자를 포함한 손님을 위한 코스를 기획한다.
 
-[필수 참고 데이터: 서울시 착한 가격업소 추천 리스트]
-{stores_info}
+[Customer Info / 고객 정보]
+- Schedule / 일정: {date}
+- Preferred categories / 선호 테마: {categories}
+- Group / 인원: {members}
+- Budget / 예산: {budget}
+- Request / 요청: {prompt}
 
-[선택 참고 데이터: 주요 장소 혼잡도 데이터]
+[Congestion Data / 혼잡도 데이터]
 {congestion_info}
 
-[지시사항]
-1. '필수 참고 데이터'에 식당이나 장소가 제공되었다면, 고객의 동선에 맞춰 우선적으로 1개만 코스에 포함시켜줘. (가게 이름과 주소를 정확히 사용할 것)
-2. 제공된 데이터가 없거나(비어있거나) 코스를 구성하기에 부족하다면, 네가 알고 있는 서울의 유명 명소, 관광지, 카페 (1-2개만) 맛집(1개만)을 자유롭게 섞어서 완벽한 코스를 만들어줘.
-3. **🚨 절대 가짜 위도/경도(GPS) 좌표를 만들지 마. 반드시 해당 장소의 정확한 'address(주소)'만 정확한 텍스트로 제공해.**
-4. **반드시 최소 5개 이상의 장소로 이루어진 꽉 찬 풀(Full) 코스**를 완성
-5. **'장소 혼잡도 데이터'가 존재하고, 사용자 프롬프트에 '한적한', '조용한', '평화로운' 등의 비슷한 단어가 온다면, 반드시 현재 '붐빔' 상태인 곳은 가급적 피하고 쾌적한 동선을 제안해줘.**
-6. 무조건 정해진 JSON 형식으로 응답해.
-위 조건들을 완벽하게 반영해서, 코스에 대한 '매력적인 소개글(description)'과 '장소 목록(places)'을 작성해줘."""
+[Place Candidates / 후보 장소 리스트] — Total {candidate_count} places
+{candidates_text}
+
+[Instructions / 지시사항]
+1. Select 5~6 places from the candidate list above, in route order (geographically efficient).
+   위 후보 중 5~6개를 동선이 효율적인 순서로 선택한다.
+2. Mix variety: food (store-*), cultural facilities (culture-*), attractions etc.
+   식당, 문화시설, 관광지를 균형있게 섞는다.
+3. If user mentions "quiet/peaceful/한적한/조용한", avoid places marked as Crowded/붐빔.
+4. Write 1~2 sentences of compelling description (in user's language).
+5. Return ONLY description and selected_ids. Do not include other fields.
+"""
 
 prompt_template = ChatPromptTemplate.from_messages([
     ("system", system_prompt),
-    ("user", "위 조건에 맞춰서 코스를 짜줘!")
+    ("user", "{language_instruction}\n\n위 조건에 맞춰 코스를 짜줘. / Plan a course based on the above.")
 ])
 
 
+# ============================================================
+# 헬퍼 함수
+# ============================================================
 
-# --- 4. API 엔드포인트 오픈 ---
-@app.post("/api/ai/course")
-async def generate_course(request: CourseRequest):
-    # logger.py에 정의해둔 로거를 사용하면 알아서 [abc-123...] Trace ID가 찍힌당 -> 만약 안되면 generate_course 파라미터로 추가x_trace_id: Optional[str] = Header(default="NoTrace", alias="X-Trace-Id")
-    logger.info(f" AI 코스 생성 요청 수신: 카테고리={request.categories}, 프롬프트='{request.prompt}', 식당 데이터={len(request.recommendedStores)}개 전달됨")
-    
+def detect_response_language(prompt: str) -> str:
+    """프롬프트 언어 감지. 한글 비율로 판단."""
+    if not prompt:
+        return 'ko'
+    korean_chars = sum(1 for c in prompt if '\uac00' <= c <= '\ud7af')
+    total_alpha = sum(1 for c in prompt if c.isalpha())
+    if total_alpha == 0:
+        return 'ko'
+    ratio = korean_chars / total_alpha
+    return 'ko' if ratio > 0.3 else 'en'
 
-    #  스프링 부트가 보내준 가게 정보 + [위도/경도]를 묶어서 AI에게 전달
-    if request.recommendedStores:
-        stores_list = []
-        for s in request.recommendedStores:
-            # null 처리: 좌표가 있으면 프롬프트에 포함, 없으면 생략
-            coord_str = f" (위도: {s.lat}, 경도: {s.lng})" if s.lat and s.lng else ""
-            stores_list.append(f"- 이름: {s.shName} (업종: {s.indutyCodeSeName}) / 정보: {s.shInfo} / 주소: {s.shAddr}{coord_str}")
-        stores_info = "\n".join(stores_list)
-    else:
-        stores_info = "조건에 맞는 가게가 없습니다. 자유롭게 서울 명소 4~5곳을 추천해주세요."
+def format_candidates(candidates: list[PlaceCandidate]) -> str:
+    """후보 리스트를 LLM이 읽기 좋은 텍스트로 변환"""
+    if not candidates:
+        return "(no candidates / 후보 없음)"
     
-    #  [혼잡도 데이터 파싱] 스프링에서 보낸 필드명(areaNm, congestionLabel)으로 수정
-    if request.congestionData:
-        valid_congestion = [
-            f"- 장소: {c.areaNm} / 예상 혼잡도: {c.congestionLabel}"
-            for c in request.congestionData 
-            if c.areaNm and c.congestionLabel and c.congestionLabel.strip() != "정보 없음"
-        ]
+    lines = []
+    for c in candidates:
+        # introduction을 80자로 잘라 토큰 절약
+        intro = ""
+        if c.introduction:
+            intro_clean = c.introduction.strip()
+            intro = f" | {intro_clean[:80]}"
         
-        if valid_congestion:
-            congestion_info = "\n".join(valid_congestion)
+        lines.append(
+            f"- id={c.id} | name={c.name} | category={c.category} "
+            f"| address={c.address}{intro}"
+        )
+    return "\n".join(lines)
+
+
+def format_congestion(congestion_data: list[SpotCongestion]) -> str:
+    """혼잡도 데이터를 텍스트로 변환"""
+    if not congestion_data:
+        return "(no congestion data / 혼잡도 데이터 없음)"
+    
+    valid = [
+        f"- {c.areaNm}: {c.congestionLabel}"
+        for c in congestion_data
+        if c.areaNm and c.congestionLabel and c.congestionLabel.strip() != "정보 없음"
+    ]
+    return "\n".join(valid) if valid else "(no valid congestion data)"
+
+
+def validate_selected_ids(selected_ids: list[str], candidates: list[PlaceCandidate]) -> list[str]:
+    """LLM이 헛소리한 ID를 걸러냄. 후보에 없는 ID는 제외."""
+    candidate_ids = {c.id for c in candidates}
+    valid = []
+    invalid = []
+    for sid in selected_ids:
+        if sid in candidate_ids:
+            valid.append(sid)
         else:
-            congestion_info = "현재 유효한 혼잡도 데이터가 없습니다."
+            invalid.append(sid)
+    if invalid:
+        logger.warning(f"LLM이 후보에 없는 ID를 반환함, 필터링: {invalid}")
+    return valid
+
+
+# ============================================================
+# 엔드포인트
+# ============================================================
+
+@app.post("/api/ai/course", response_model=CourseResponse)
+async def generate_course(request: CourseRequest):
+    logger.info(
+        f"AI 코스 생성 요청: 카테고리={request.categories}, "
+        f"프롬프트='{request.prompt}', 후보 {len(request.candidates)}개"
+    )
+
+    # 후보가 너무 적으면 일찍 실패
+    if len(request.candidates) < 5:
+        logger.error(f"후보 부족: {len(request.candidates)}개. 최소 5개 필요")
+        raise HTTPException(
+            status_code=422,
+            detail=f"후보 장소가 부족합니다 ({len(request.candidates)}개)"
+        )
+    
+
+    #  언어 감지
+    detected_lang = detect_response_language(request.prompt)
+    if detected_lang == 'en':
+        language_instruction = (
+        "🚨 CRITICAL LANGUAGE RULE: The user wrote in English. "
+        "You MUST write the 'description' field in ENGLISH ONLY.\n\n"
+        "📝 PLACE NAME FORMAT: When mentioning Korean place names in the description, "
+        "use BILINGUAL format: 'English Name(한국어이름)'.\n"
+        "Examples:\n"
+        "  - 'Bukchon Hanok Village(북촌한옥마을)'\n"
+        "  - 'Gyeongbokgung Palace(경복궁)'\n"
+        "  - 'N Seoul Tower(N서울타워)'\n"
+        "  - 'Insadong(인사동)'\n"
+        "This dual notation helps foreign visitors navigate Korea — they can show "
+        "the Korean name to locals or taxi drivers.\n\n"
+        "⚠️ This rule applies to the 'description' text ONLY. "
+        "The 'selected_ids' MUST remain exactly as the candidate IDs (e.g., 'culture-3'). "
+        "Do not modify or translate the IDs."
+    )
     else:
-        congestion_info = "현재 제공된 혼잡도 데이터가 없습니다."
+        language_instruction = (
+            "🚨 언어 규칙: 사용자 요청은 한국어이다. "
+            "description 필드는 반드시 한국어로 작성한다."
+        )
+    
+    logger.info(f"[Language] 감지된 응답 언어: {detected_lang}")
 
-    # LM에게 주입될 '혼잡도 데이터 원본' 로그 확인
-    logger.info(f"[Prompt Input] 전달된 혼잡도 정보:\n{congestion_info}")
 
-    # LangChain 체인 연결 (프롬프트 -> 구조화된 LLM)
+    candidates_text = format_candidates(request.candidates)
+    congestion_info = format_congestion(request.congestionData)
+
+    logger.info(f"[Prompt] 후보 {len(request.candidates)}개 LLM에 전달")
+
     chain = prompt_template | structured_llm
 
     try:
-        result = chain.invoke({
+        result: CourseResponse = chain.invoke({
             "date": request.date,
             "categories": ", ".join(request.categories),
             "members": request.members,
             "budget": request.budget,
             "prompt": request.prompt,
-            "stores_info": stores_info,
-            "congestion_info": congestion_info
+            "candidates_text": candidates_text,
+            "candidate_count": len(request.candidates),
+            "congestion_info": congestion_info,
+            "language_instruction": language_instruction,
         })
-        logger.info(f"AI 코스 생성 완료: 총 {len(result.places)}개 장소 반환")
-        return result
-        
+
+        # ID 검증: LLM이 환각으로 만든 ID 제거
+        validated_ids = validate_selected_ids(result.selected_ids, request.candidates)
+
+        if len(validated_ids) < 4:
+            logger.error(
+                f"유효 ID 부족: LLM 반환 {len(result.selected_ids)}개, "
+                f"검증 통과 {len(validated_ids)}개"
+            )
+            raise HTTPException(
+                status_code=422,
+                detail="AI가 충분한 장소를 선택하지 못했습니다. 다시 시도해주세요."
+            )
+
+        # 검증된 ID로 응답 재구성
+        final_response = CourseResponse(
+            description=result.description,
+            selected_ids=validated_ids
+        )
+
+        logger.info(
+            f"AI 코스 생성 완료: 선택 ID {len(validated_ids)}개 "
+            f"(원본 {len(result.selected_ids)}개)"
+        )
+        logger.info(f"[Selected IDs] {validated_ids}")
+        return final_response
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"LLM 체인 실행 중 에러 발생: {str(e)}")
-        # FastAPI에서 클라이언트(스프링/안드로이드)에게 적절한 500 에러 응답을 내려주는 처리 필요
+        logger.error(f"LLM 체인 실행 중 에러 발생: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="AI 코스 생성에 실패했습니다.")
